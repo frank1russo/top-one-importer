@@ -5,7 +5,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill
 
 
@@ -159,31 +159,71 @@ def autosize_columns(worksheet) -> None:
         worksheet.column_dimensions[column_letter].width = min(max(max_length + 2, 12), 40)
 
 
-def add_trade_worksheet(workbook: Workbook, csv_path: Path):
-    worksheet = workbook.create_sheet(csv_path.name[:31])
-    worksheet.append(HEADERS)
+def apply_trade_row_formatting(worksheet, excel_row: int) -> None:
+    worksheet.cell(excel_row, 5).number_format = DATETIME_FORMAT
+    worksheet.cell(excel_row, 7).number_format = DATETIME_FORMAT
+    for column in (6, 8, 10, 11, 12):
+        worksheet.cell(excel_row, column).number_format = CURRENCY_FORMAT
+    if worksheet.cell(excel_row, 9).value < 10:
+        worksheet.cell(excel_row, 9).fill = PatternFill(fill_type="solid", fgColor="FFFF00")
+
+
+def trade_key(values: list[object]) -> tuple[object, ...]:
+    ticket = str(values[0]).strip()
+    return ("ticket", ticket) if ticket else ("trade", *values[1:])
+
+
+def update_trade_worksheet(workbook: Workbook, csv_path: Path) -> tuple[object, int, int]:
+    sheet_name = csv_path.stem.removeprefix("Trade-History-")[:31]
+    legacy_sheet_name = csv_path.name[:31]
+    if sheet_name in workbook.sheetnames:
+        worksheet = workbook[sheet_name]
+        existing_headers = [worksheet.cell(1, column).value for column in range(1, len(HEADERS) + 1)]
+        if existing_headers != HEADERS:
+            raise ValueError(f"Unexpected headers in worksheet {sheet_name!r}")
+    elif legacy_sheet_name in workbook.sheetnames:
+        worksheet = workbook[legacy_sheet_name]
+        worksheet.title = sheet_name
+        existing_headers = [worksheet.cell(1, column).value for column in range(1, len(HEADERS) + 1)]
+        if existing_headers != HEADERS:
+            raise ValueError(f"Unexpected headers in worksheet {sheet_name!r}")
+    else:
+        worksheet = workbook.create_sheet(sheet_name)
+        worksheet.append(HEADERS)
+
     worksheet.freeze_panes = "A2"
-
-    with csv_path.open("r", newline="", encoding="utf-8-sig") as source:
-        reader = csv.DictReader(source)
-        for row_number, row in enumerate(reader, start=1):
-            values = trade_values(row, row_number)
-            worksheet.append(values + [None])
-            excel_row = worksheet.max_row
-            worksheet.cell(excel_row, 12, f"=J{excel_row}-K{excel_row}")
-
     header_font = Font(bold=True)
     for cell in worksheet[1]:
         cell.font = header_font
 
-    duration_fill = PatternFill(fill_type="solid", fgColor="FFFF00")
-    for excel_row in range(2, worksheet.max_row + 1):
-        worksheet.cell(excel_row, 5).number_format = DATETIME_FORMAT
-        worksheet.cell(excel_row, 7).number_format = DATETIME_FORMAT
-        for column in (6, 8, 10, 11, 12):
-            worksheet.cell(excel_row, column).number_format = CURRENCY_FORMAT
-        if worksheet.cell(excel_row, 9).value < 10:
-            worksheet.cell(excel_row, 9).fill = duration_fill
+    total_row = next(
+        (row for row in range(2, worksheet.max_row + 1) if worksheet.cell(row, 1).value == "Total:"),
+        worksheet.max_row + 1,
+    )
+    existing_keys = {
+        trade_key([worksheet.cell(row, column).value for column in range(1, 12)])
+        for row in range(2, total_row)
+    }
+
+    new_trades: list[list[object]] = []
+    with csv_path.open("r", newline="", encoding="utf-8-sig") as source:
+        reader = csv.DictReader(source)
+        for row_number, row in enumerate(reader, start=1):
+            values = trade_values(row, row_number)
+            key = trade_key(values)
+            if key in existing_keys:
+                continue
+            existing_keys.add(key)
+            new_trades.append(values)
+
+    if total_row <= worksheet.max_row:
+        worksheet.delete_rows(total_row)
+
+    for values in new_trades:
+        worksheet.append(values + [None])
+        excel_row = worksheet.max_row
+        worksheet.cell(excel_row, 12, f"=J{excel_row}-K{excel_row}")
+        apply_trade_row_formatting(worksheet, excel_row)
 
     total_row = worksheet.max_row + 1
     worksheet.cell(total_row, 1, "Total:")
@@ -193,7 +233,7 @@ def add_trade_worksheet(workbook: Workbook, csv_path: Path):
     worksheet.cell(total_row, 12).number_format = CURRENCY_FORMAT
 
     autosize_columns(worksheet)
-    return worksheet, total_row
+    return worksheet, total_row, len(new_trades)
 
 
 def main() -> None:
@@ -201,9 +241,22 @@ def main() -> None:
     if not csv_files:
         raise SystemExit(f"No CSV files found in {IMPORTS_DIR}")
 
-    workbook = Workbook()
-    summary = workbook.active
-    summary.title = "Summary"
+    output_path = CONVERTED_DIR / "main_trade_history.xlsx"
+    if output_path.exists():
+        workbook = load_workbook(output_path)
+    else:
+        workbook = Workbook()
+
+    if "Summary" in workbook.sheetnames:
+        summary = workbook["Summary"]
+    else:
+        summary = workbook.create_sheet("Summary", 0)
+    if workbook.worksheets[0] is not summary:
+        workbook._sheets.remove(summary)
+        workbook._sheets.insert(0, summary)
+
+    if summary.max_row:
+        summary.delete_rows(1, summary.max_row)
     summary.append(["Worksheet", "Total PnL"])
     summary.freeze_panes = "A2"
     header_font = Font(bold=True)
@@ -211,11 +264,12 @@ def main() -> None:
         cell.font = header_font
 
     for csv_path in csv_files:
-        worksheet, total_row = add_trade_worksheet(workbook, csv_path)
+        worksheet, total_row, new_count = update_trade_worksheet(workbook, csv_path)
         summary_row = summary.max_row + 1
         escaped_name = worksheet.title.replace("'", "''")
         summary.append([worksheet.title, f"='{escaped_name}'!L{total_row}"])
         summary.cell(summary_row, 2).number_format = CURRENCY_FORMAT
+        print(f"{worksheet.title}: added {new_count} new trades")
 
     summary_total_row = summary.max_row + 1
     summary.cell(summary_total_row, 1, "Total:")
@@ -226,9 +280,8 @@ def main() -> None:
     autosize_columns(summary)
 
     CONVERTED_DIR.mkdir(parents=True, exist_ok=True)
-    output_path = CONVERTED_DIR / "main_trade_history.xlsx"
     workbook.save(output_path)
-    print(f"Created {output_path.relative_to(ROOT)}")
+    print(f"Updated {output_path.relative_to(ROOT)}")
 
 
 if __name__ == "__main__":
